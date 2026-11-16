@@ -181,6 +181,11 @@ def _load_metadata(cur) -> dict[str, TableMeta]:
     return tables
 
 
+def load_metadata(cur) -> dict[str, TableMeta]:
+    """读取 public schema 全部基表的列/主键/外键元数据（供历史溯源模块复用）。"""
+    return _load_metadata(cur)
+
+
 def _fetch_row(cur, tmeta: TableMeta, pk: tuple) -> dict | None:
     where = sql.SQL(" AND ").join(
         sql.SQL("{} = %s").format(sql.Identifier(c)) for c in tmeta.pk_columns

@@ -7,6 +7,9 @@ services:
       POSTGRES_DB: labdb
     volumes:
       - ./db/init:/docker-entrypoint-initdb.d:ro
+      # 命名卷持久化数据：服务重启/容器重建后，留痕历史与触发器不丢失
+      # （docker compose down 不丢；down -v 才会清空）
+      - pgdata:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U lab -d labdb"]
       interval: 2s
@@ -24,3 +27,6 @@ services:
         condition: service_healthy
     ports:
       - "8000:8000"
+
+volumes:
+  pgdata:

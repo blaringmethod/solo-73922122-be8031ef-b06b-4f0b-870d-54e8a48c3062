@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>历史溯源 · 检测单更正留痕</title>
+<style>
+  body { font-family: system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+         margin: 2rem auto; max-width: 1080px; padding: 0 1rem; color: #222; }
+  h1 { font-size: 1.4rem; }
+  h2 { font-size: 1.1rem; margin-top: 1.8rem; }
+  .box { border: 1px solid #ddd; border-radius: 8px; padding: .8rem 1.2rem; margin: 1rem 0; }
+  .banner { border: 1px solid #9fd0a9; background: #f0faf1; border-radius: 8px;
+            padding: .7rem 1.2rem; margin: 1rem 0; }
+  .off { border-color: #e0c9a6; background: #fffaf0; }
+  .on  { border-color: #9fd0a9; background: #f0faf1; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { border: 1px solid #ddd; padding: .45rem .6rem; text-align: left; font-size: .92rem; }
+  th { background: #f0f4f8; }
+  a.btn, button.btn { display: inline-block; padding: .25rem .7rem; border-radius: 6px;
+          background: #1769aa; color: #fff; text-decoration: none; font-size: .88rem;
+          border: none; cursor: pointer; }
+  a.btn:hover, button.btn:hover { background: #0d4f86; }
+  .muted { color: #888; }
+  tr.irrelevant td { color: #aaa; background: #fafafa; }
+  .pill { display: inline-block; padding: .1rem .55rem; border-radius: 999px; font-size: .8rem; }
+  .pill.ok { background: #dcf0dc; color: #1c6b1c; }
+  select { font-size: .95rem; padding: .25rem .4rem; }
+  a { color: #1769aa; }
+</style>
+</head>
+<body>
+<h1>历史溯源 · 检测单更正留痕</h1>
+<p><a href="/">← 返回导出页</a></p>
+
+{% if msg %}<div class="banner">{{ msg }}</div>{% endif %}
+
+{% if not status.enabled %}
+<div class="box off">
+  <h2 style="margin-top:0">留痕未启用</h2>
+  <p>启用后将立即保存四表基线，此后<b>任何 SQL 连接</b>对四表的行级增删改都会按事务记录为「更正」，
+     可按实际提交顺序回看任一检测单在每次更正前后的检测单、样本、批次及复测引用路径。</p>
+  <p class="muted">启用瞬间会短暂锁定四表（仅阻塞写入，通常毫秒级；拿不到锁会快速失败，可重试）。</p>
+  <form method="post" action="/history/enable">
+    <button class="btn" type="submit">启用留痕并保存基线</button>
+  </form>
+</div>
+{% else %}
+<div class="box on">
+  <span class="pill ok">留痕已启用</span>
+  &nbsp;启用时间 {{ status.enabled_at|dt }} ｜ 基线 {{ status.baseline_rows }} 行 ｜
+  已记录更正 {{ status.corrections }} 笔
+</div>
+
+<h2>选择检测单</h2>
+<form method="get" action="/history">
+  <select name="order_id">
+    {% for o in orders %}
+    <option value="{{ o.id }}" {% if o.id == order_id %}selected{% endif %}>
+      #{{ o.id }}&nbsp;{{ o.order_no }}{% if not o.exists_now %}（已删除）{% endif %}
+    </option>
+    {% endfor %}
+  </select>
+  <button class="btn" type="submit">查看相关更正</button>
+</form>
+
+{% if order_id is not none %}
+  {% if not order_exists %}
+  <div class="box off">检测单 #{{ order_id }} 在当前库与历史记录中均不存在。</div>
+  {% else %}
+  <h2>检测单 #{{ order_id }} 的更正（按实际提交顺序）</h2>
+  <p class="muted">
+    {% if show_all %}
+      正在显示全部更正（与本单无关的不提供前后对比）｜
+      <a href="/history?order_id={{ order_id }}">只看影响本单的更正</a>
+    {% else %}
+      只显示影响本单关联闭包（含样本/批次/复测关联主档）的更正｜
+      <a href="/history?order_id={{ order_id }}&all=1">显示全部更正</a>
+    {% endif %}
+  </p>
+  <table>
+    <tr>
+      <th>更正 #</th><th>提交时间</th><th>事务号</th><th>用户 / 应用</th>
+      <th>变更摘要</th><th>操作</th>
+    </tr>
+    {% for c in corrections %}
+      {% set rel = relevance[c.commit_seq] %}
+      {% if show_all or rel %}
+      <tr class="{{ '' if rel else 'irrelevant' }}">
+        <td>{{ c.commit_seq }}</td>
+        <td>{{ c.committed_at|dt }}</td>
+        <td>{{ c.txid }}</td>
+        <td>{{ c.db_user }}{% if c.application_name %} / {{ c.application_name }}{% endif %}</td>
+        <td>{{ c.summary() }}</td>
+        <td>
+          {% if rel %}
+          <a class="btn" href="/history/order/{{ order_id }}/correction/{{ c.commit_seq }}">前后对比</a>
+          {% else %}
+          <span class="muted">不影响本单</span>
+          {% endif %}
+        </td>
+      </tr>
+      {% endif %}
+    {% endfor %}
+  </table>
+  {% endif %}
+{% else %}
+<p class="muted">请选择一张检测单，查看与其关联数据相关的已提交更正。</p>
+{% endif %}
+{% endif %}
+</body>
+</html>

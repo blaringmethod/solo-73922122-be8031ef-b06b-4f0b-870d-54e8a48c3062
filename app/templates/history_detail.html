@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>更正 #{{ corr.commit_seq }} 前后对比 · 检测单 #{{ order_id }}</title>
+<style>
+  body { font-family: system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+         margin: 2rem auto; max-width: 1080px; padding: 0 1rem; color: #222; }
+  h1 { font-size: 1.35rem; }
+  h2 { font-size: 1.1rem; margin-top: 1.8rem; }
+  h3 { font-size: 1rem; margin-bottom: .4rem; }
+  .box { border: 1px solid #ddd; border-radius: 8px; padding: .8rem 1.2rem; margin: 1rem 0; }
+  table { border-collapse: collapse; width: 100%; margin-bottom: 1.2rem; }
+  th, td { border: 1px solid #ddd; padding: .4rem .6rem; text-align: left; font-size: .9rem; }
+  th { background: #f0f4f8; }
+  td.added { background: #e6f6e6; }
+  td.removed { background: #fbe7e7; color: #8a2b2b; }
+  td.changed { background: #fff3cd; }
+  tr.removed td { background: #fbe7e7; color: #8a2b2b; }
+  tr.added td { background: #e6f6e6; }
+  .muted { color: #888; }
+  .pill { display: inline-block; padding: .1rem .55rem; border-radius: 999px; font-size: .8rem; }
+  .pill.ok { background: #dcf0dc; color: #1c6b1c; }
+  .pill.warn { background: #fdeecd; color: #8a6d1c; }
+  .path { font-family: ui-monospace, monospace; font-size: .95rem; }
+  .change { border: 1px solid #e3e3e3; border-radius: 8px; padding: .5rem 1rem; margin: .6rem 0; }
+  a { color: #1769aa; }
+  .nav a { margin-right: 1rem; }
+</style>
+</head>
+<body>
+<h1>检测单 #{{ order_id }}{% if order_no %}（{{ order_no }}）{% endif %} · 更正 #{{ corr.commit_seq }} 前后对比</h1>
+<p class="nav"><a href="/history?order_id={{ order_id }}">← 返回该单更正列表</a>
+<a href="/history">历史溯源首页</a></p>
+
+<div class="box">
+  提交时间 <b>{{ corr.committed_at|dt }}</b> ｜ 事务号 {{ corr.txid }} ｜
+  事务开始 {{ corr.started_at|dt }} ｜ 用户 {{ corr.db_user }}
+  {% if corr.application_name %} ｜ 应用 {{ corr.application_name }}{% endif %}
+  {% if not relevant %}<br><span class="pill warn">本次更正未触及该检测单的关联闭包</span>{% endif %}
+</div>
+
+<h2>复测引用路径</h2>
+<table>
+  <tr><th style="width:6rem"></th><th>路径</th></tr>
+  <tr><td>更正前</td><td class="path">{{ path_before }}</td></tr>
+  <tr><td>更正后</td><td class="path">{{ path_after }}</td></tr>
+</table>
+
+<h2>关联闭包前后对比（检测单 / 样本 / 批次 / 复测关联）</h2>
+{% if not any_changed %}
+<p class="muted">本次更正未改变该检测单关联闭包内的任何行。</p>
+{% endif %}
+{% for block in diffs %}
+<h3>{{ block.table }}
+  {% if block.n_changed %}<span class="pill warn">{{ block.n_changed }} 行有变化</span>
+  {% else %}<span class="muted">（无变化）</span>{% endif %}
+</h3>
+<table>
+  <tr><th style="width:4rem">状态</th>{% for col in block.columns %}<th>{{ col }}</th>{% endfor %}</tr>
+  {% for r in block.rows %}
+  <tr class="{{ r.status if r.status in ('added','removed') else '' }}">
+    <td>
+      {% if r.status == 'added' %}新增
+      {% elif r.status == 'removed' %}删除
+      {% elif r.status == 'changed' %}修改
+      {% else %}<span class="muted">—</span>{% endif %}
+    </td>
+    {% for col in block.columns %}
+      {% if r.status == 'added' %}
+    <td class="added">{{ r.new[col]|val }}</td>
+      {% elif r.status == 'removed' %}
+    <td class="removed">{{ r.old[col]|val }}</td>
+      {% elif col in r.changed_cols %}
+    <td class="changed">{{ r.old[col]|val }} → {{ r.new[col]|val }}</td>
+      {% else %}
+    <td>{{ r.new[col]|val }}</td>
+      {% endif %}
+    {% endfor %}
+  </tr>
+  {% endfor %}
+</table>
+{% endfor %}
+
+<h2>本次更正的全部行级操作（同一事务，共 {{ changes|length }} 条）</h2>
+{% for ch in changes %}
+<div class="change">
+  <b>{{ ch.table }}</b>
+  {% if ch.op == 'I' %}插入{% elif ch.op == 'U' %}更新{% else %}删除{% endif %}
+  {% if ch.in_closure %}<span class="pill ok">触及本单闭包</span>
+  {% else %}<span class="muted">（闭包外修改）</span>{% endif %}
+  <table>
+    <tr><th>列</th><th>改前</th><th>改后</th></tr>
+    {% for f in ch.fields %}
+    <tr>
+      <td>{{ f.col }}</td>
+      <td class="{{ 'changed' if f.changed else '' }}">{{ f.old|val }}</td>
+      <td class="{{ 'changed' if f.changed else '' }}">{{ f.new|val }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+{% endfor %}
+
+<p class="nav">
+  {% if prev_seq %}<a href="/history/order/{{ order_id }}/correction/{{ prev_seq }}">← 上一笔相关更正 #{{ prev_seq }}</a>{% endif %}
+  {% if next_seq %}<a href="/history/order/{{ order_id }}/correction/{{ next_seq }}">下一笔相关更正 #{{ next_seq }} →</a>{% endif %}
+</p>
+</body>
+</html>

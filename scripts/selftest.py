@@ -50,6 +50,16 @@ def http_get(url: str):
         return e.code, {k.lower(): v for k, v in e.headers.items()}, e.read()
 
 
+def http_post(url: str):
+    """POST（空 body）；303 重定向由 urllib 自动跟随为 GET。"""
+    req = urllib.request.Request(url, data=b"", method="POST")
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return resp.status, {k.lower(): v for k, v in resp.headers.items()}, resp.read()
+    except urllib.error.HTTPError as e:
+        return e.code, {k.lower(): v for k, v in e.headers.items()}, e.read()
+
+
 def download(order_id: int) -> tuple[int, dict, bytes]:
     return http_get(f"{APP_URL}/export/{order_id}")
 
@@ -255,6 +265,249 @@ def test_failure_path():
     check("数据库不可用时首页返回 500 错误页", status2 == 500, f"status={status2}")
 
 
+# ---------------------------------------------------------------- 历史溯源
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+AUDIT_TABLES = ("batches", "samples", "test_orders", "retest_links")
+
+
+def _history_cleanup():
+    """还原到启用前状态：删触发器与 audit 方案、恢复演示数据。
+
+    保证自测可重复运行；也用于上次运行中途失败后的现场清理。
+    """
+    try:
+        with psycopg.connect(DATABASE_URL, autocommit=True) as conn:
+            if not conn.execute(
+                "SELECT to_regclass('audit.meta') IS NOT NULL"
+            ).fetchone()[0]:
+                return
+            for t in AUDIT_TABLES:
+                for trg in ("audit_log_row", "audit_seal_tx", "audit_block_truncate"):
+                    conn.execute(f'DROP TRIGGER IF EXISTS {trg} ON "{t}"')
+            conn.execute("DROP SCHEMA audit CASCADE")
+            conn.execute(
+                "TRUNCATE batches, samples, test_orders, retest_links "
+                "RESTART IDENTITY CASCADE"
+            )
+            with open(os.path.join(REPO_ROOT, "db", "init", "02_seed.sql"),
+                      encoding="utf-8") as f:
+                conn.execute(f.read())
+    except Exception as e:  # noqa: BLE001
+        print(f"[WARN] 留痕清理失败（可手动执行 DROP SCHEMA audit CASCADE 后重试）: {e}")
+
+
+def _test_history_inner():
+    # 1) 未启用状态
+    status, _, body = http_get(f"{APP_URL}/history")
+    html = body.decode("utf-8", "replace")
+    check("历史页(未启用)返回 200", status == 200, f"status={status}")
+    check("历史页(未启用)显示未启用", "未启用" in html)
+
+    # 2) 启用留痕（POST 303 -> GET）
+    status, _, body = http_post(f"{APP_URL}/history/enable")
+    html = body.decode("utf-8", "replace")
+    check("启用留痕成功", status == 200 and "留痕已启用" in html, f"status={status}")
+    status, _, body = http_post(f"{APP_URL}/history/enable")
+    check("重复启用提示已启用、不改写历史",
+          status == 200 and "此前已启用" in body.decode("utf-8", "replace"),
+          f"status={status}")
+
+    # 3) 基线行数 = 启用瞬间的四表内容
+    with psycopg.connect(DATABASE_URL) as conn:
+        base = dict(conn.execute(
+            "SELECT table_name, count(*) FROM audit.baseline GROUP BY table_name"
+        ).fetchall())
+    check("基线四表行数正确",
+          base == {"batches": 3, "samples": 6, "test_orders": 8, "retest_links": 3},
+          f"got {base}")
+
+    # 4) 原导出不受留痕影响（audit 对象不在 public schema）
+    st, _, b4 = download(4)
+    sql4 = b4.decode("utf-8")
+    check("启用留痕后导出仍只含 4 个 CREATE TABLE",
+          st == 200 and sql4.count("CREATE TABLE") == 4, f"status={st}")
+
+    # 5) 通过独立 SQL 连接（不经过应用）制造更正
+    #    预期提交顺序: C1=1, C2=2, B=3, A=4, C6=5, C7=6
+    w = psycopg.connect(DATABASE_URL, autocommit=True)
+    w.execute("SET application_name = 'selftest-writer'")
+    w.execute("UPDATE samples SET sample_code='S-001*' WHERE id=1")        # C1 单行修改
+    with psycopg.connect(DATABASE_URL) as tx:                               # C2 一个事务两处修改
+        tx.execute("UPDATE batches SET note='加急批次·已复核' WHERE id=2")
+        tx.execute("UPDATE test_orders SET status='closed' WHERE id=4")
+    rb = psycopg.connect(DATABASE_URL)                                      # C3 回滚不留痕
+    rb.execute("UPDATE samples SET sample_code='GHOST' WHERE id=2")
+    rb.rollback()
+    rb.close()
+    tx_a = psycopg.connect(DATABASE_URL)                                    # A 先写
+    tx_a.execute("UPDATE batches SET note='常规批次·改A' WHERE id=1")
+    tx_b = psycopg.connect(DATABASE_URL)
+    tx_b.execute("UPDATE samples SET sample_code='S-003*' WHERE id=3")      # B 后写
+    tx_b.commit()                                                           # B 先提交 -> 序号更小
+    tx_b.close()
+    tx_a.commit()                                                           # A 后提交 -> 序号更大
+    tx_a.close()
+    with psycopg.connect(DATABASE_URL) as tx:                               # C6 删除并复用编号
+        tx.execute("DELETE FROM test_orders WHERE id=8")
+        tx.execute("INSERT INTO test_orders VALUES (8, 6, 'ORD-008R', 'done', NULL, NULL)")
+    w.execute("UPDATE batches SET note='常规批次·已锁定' WHERE id=1")        # C7 只改主档
+    w.close()
+
+    # 6) 数据库侧断言
+    with psycopg.connect(DATABASE_URL) as conn:
+        seqs = [r[0] for r in conn.execute(
+            "SELECT commit_seq FROM audit.tx WHERE commit_seq IS NOT NULL "
+            "ORDER BY commit_seq").fetchall()]
+        check("已提交更正共 6 笔且序号连续", seqs == [1, 2, 3, 4, 5, 6],
+              f"got {seqs}")
+        c2_txid = conn.execute(
+            "SELECT txid FROM audit.row_change "
+            "WHERE table_name='batches' AND new_row->>'note'='加急批次·已复核'"
+        ).fetchone()[0]
+        n = conn.execute(
+            "SELECT count(*) FROM audit.row_change WHERE txid=%s", (c2_txid,)
+        ).fetchone()[0]
+        check("一个事务的多次修改归为一笔更正", n == 2, f"changes={n}")
+        ghost = conn.execute(
+            "SELECT count(*) FROM audit.row_change "
+            "WHERE coalesce(new_row->>'sample_code', old_row->>'sample_code')='GHOST'"
+        ).fetchone()[0]
+        check("回滚不留历史", ghost == 0)
+        seq_b = conn.execute(
+            "SELECT commit_seq FROM audit.tx t JOIN audit.row_change r USING (txid) "
+            "WHERE r.table_name='samples' AND r.new_row->>'sample_code'='S-003*'"
+        ).fetchone()[0]
+        seq_a = conn.execute(
+            "SELECT commit_seq FROM audit.tx t JOIN audit.row_change r USING (txid) "
+            "WHERE r.table_name='batches' AND r.new_row->>'note'='常规批次·改A'"
+        ).fetchone()[0]
+        check("先写后提交按实际提交顺序归位", seq_b < seq_a,
+              f"B(seq={seq_b}) 应先于 A(seq={seq_a})")
+        ntrig = conn.execute(
+            "SELECT count(*) FROM pg_trigger WHERE tgname LIKE 'audit\\_%'"
+        ).fetchone()[0]
+        check("留痕触发器持久化于数据库目录(4表×3)", ntrig == 12, f"got {ntrig}")
+
+    # 7) 网页断言
+    st, _, b = http_get(f"{APP_URL}/history?order_id=1")
+    h = b.decode("utf-8", "replace")
+    check("检测单1的更正列表返回 200", st == 200, f"status={st}")
+    check("检测单1列出相关更正(1,4,6)",
+          all(f"/history/order/1/correction/{s}" in h for s in (1, 4, 6)))
+    check("检测单1默认不列出无关更正(2,3,5)的对比链接",
+          not any(f"/history/order/1/correction/{s}" in h for s in (2, 3, 5)))
+    st, _, b = http_get(f"{APP_URL}/history?order_id=1&all=1")
+    check("全部模式下无关更正可见但标注不影响本单",
+          st == 200 and "不影响本单" in b.decode("utf-8", "replace"))
+
+    st, _, b = http_get(f"{APP_URL}/history/order/1/correction/1")
+    h = b.decode("utf-8", "replace")
+    check("更正1前后对比返回 200", st == 200, f"status={st}")
+    check("更正1显示样本改前改后", "S-001" in h and "S-001*" in h)
+
+    st, _, b = http_get(f"{APP_URL}/history/order/4/correction/2")
+    h = b.decode("utf-8", "replace")
+    check("更正2显示检测单状态与批次主档变化",
+          st == 200 and "closed" in h and "加急批次·已复核" in h, f"status={st}")
+    check("更正2显示复测引用路径(ORD-004→…→ORD-006)",
+          "ORD-004" in h and "ORD-006" in h)
+
+    st, _, b = http_get(f"{APP_URL}/history/order/8/correction/5")
+    h = b.decode("utf-8", "replace")
+    check("删除后复用编号：前后分别为 ORD-008 / ORD-008R",
+          st == 200 and "ORD-008" in h and "ORD-008R" in h, f"status={st}")
+
+    st, _, _ = http_get(f"{APP_URL}/history/order/1/correction/999")
+    check("不存在的更正返回 404", st == 404, f"status={st}")
+
+    # 8) 未提交长事务不阻塞无关样本更正；其回滚后无留痕
+    long_tx = psycopg.connect(DATABASE_URL)
+    long_tx.execute("UPDATE samples SET sample_code='S-004*' WHERE id=4")  # 保持未提交
+    blocked = False
+    try:
+        with psycopg.connect(DATABASE_URL, autocommit=True) as w2:
+            w2.execute("SET lock_timeout = '8s'")
+            w2.execute("UPDATE samples SET sample_code='S-002*' WHERE id=2")
+    except psycopg.errors.LockNotAvailable:
+        blocked = True
+    check("未提交长事务不阻塞无关样本更正", not blocked)
+    long_tx.rollback()
+    long_tx.close()
+    with psycopg.connect(DATABASE_URL) as conn:
+        n = conn.execute(
+            "SELECT count(*) FROM audit.row_change "
+            "WHERE new_row->>'sample_code'='S-004*'").fetchone()[0]
+    check("长事务回滚后无留痕", n == 0)
+
+    # 9) 浏览历史(快照读)不阻塞写入
+    reader = psycopg.connect(DATABASE_URL)
+    reader.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
+    reader.read_only = True
+    reader.execute("SELECT count(*) FROM audit.tx").fetchone()
+    blocked = False
+    try:
+        with psycopg.connect(DATABASE_URL, autocommit=True) as w3:
+            w3.execute("SET lock_timeout = '8s'")
+            w3.execute("UPDATE batches SET note='加急批次·二改' WHERE id=2")
+    except psycopg.errors.LockNotAvailable:
+        blocked = True
+    check("浏览历史(快照读)不阻塞写入", not blocked)
+    reader.close()
+
+    # 10) 留痕失败须连同源修改回滚，不留半次更正
+    adm = psycopg.connect(DATABASE_URL, autocommit=True)
+    adm.execute("ALTER TABLE audit.row_change DROP COLUMN new_row")  # 人为制造留痕故障
+    failed = False
+    try:
+        with psycopg.connect(DATABASE_URL, autocommit=True) as conn:
+            conn.execute("UPDATE samples SET sample_code='ZAP' WHERE id=5")
+    except psycopg.Error:
+        failed = True
+    finally:  # 无论断言结果如何都先恢复留痕能力
+        adm.execute("ALTER TABLE audit.row_change ADD COLUMN new_row jsonb")
+    check("留痕失败时源修改随之失败", failed)
+    with psycopg.connect(DATABASE_URL) as conn:
+        v = conn.execute("SELECT sample_code FROM samples WHERE id=5").fetchone()[0]
+        n = conn.execute(
+            "SELECT count(*) FROM audit.row_change "
+            "WHERE coalesce(new_row->>'sample_code', old_row->>'sample_code')='ZAP'"
+        ).fetchone()[0]
+    check("留痕失败不留半次更正", v == "S-005" and n == 0, f"sample5={v!r} audit={n}")
+    with psycopg.connect(DATABASE_URL, autocommit=True) as conn:
+        conn.execute("UPDATE samples SET sample_code='S-005*' WHERE id=5")
+    with psycopg.connect(DATABASE_URL) as conn:
+        n = conn.execute(
+            "SELECT count(*) FROM audit.row_change "
+            "WHERE new_row->>'sample_code'='S-005*'").fetchone()[0]
+    check("留痕恢复后正常记录", n == 1)
+    adm.close()
+
+    # 11) TRUNCATE 被拦截（TRUNCATE 不产生行级事件，放行会丢历史）
+    trunc_blocked = False
+    try:
+        with psycopg.connect(DATABASE_URL, autocommit=True) as conn:
+            conn.execute("TRUNCATE samples")
+    except psycopg.Error:
+        trunc_blocked = True
+    check("留痕期间禁止 TRUNCATE 被留痕表", trunc_blocked)
+    with psycopg.connect(DATABASE_URL) as conn:
+        n = conn.execute("SELECT count(*) FROM samples").fetchone()[0]
+    check("TRUNCATE 被拦截后数据完好", n == 6, f"samples={n}")
+
+
+def test_history():
+    """历史溯源端到端：启用/基线/捕获/提交顺序/回滚/编号复用/主档影响/原子性。
+
+    会修改演示数据并启用留痕；结束时还原到启用前状态，保证自测可重复运行。
+    """
+    _history_cleanup()  # 上次运行若中途失败，先还原现场
+    try:
+        _test_history_inner()
+    finally:
+        _history_cleanup()
+
+
 def main():
     test_index()
     test_export_content()
@@ -262,6 +515,7 @@ def main():
     test_not_found()
     test_snapshot_isolation()
     test_failure_path()
+    test_history()
     print()
     if FAILURES:
         print(f"共 {len(FAILURES)} 项失败: {FAILURES}")

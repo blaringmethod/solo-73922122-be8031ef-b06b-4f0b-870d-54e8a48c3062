@@ -1,15 +1,29 @@
-"""FastAPI 入口：选择检测单，下载可在空库执行的关联数据 SQL。"""
+"""FastAPI 入口：选择检测单，下载可在空库执行的关联数据 SQL；历史溯源网页。"""
 from __future__ import annotations
 
 import os
+from urllib.parse import quote
 
 import psycopg
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 from psycopg.rows import dict_row
 
-from extractor import ExtractError, RootNotFound, extract_order
+from extractor import ROOT_TABLE, ExtractError, RootNotFound, extract_order
+from history import (
+    AlreadyEnabled,
+    audit_status,
+    build_timeline,
+    closure,
+    closure_keys,
+    correction_relevance,
+    describe_changes,
+    diff_closures,
+    enable_audit,
+    known_orders,
+    retest_path,
+)
 from sqlgen import build_sql
 
 DATABASE_URL = os.environ.get(
@@ -18,6 +32,20 @@ DATABASE_URL = os.environ.get(
 
 app = FastAPI(title="检测单关联数据抽取")
 templates = Jinja2Templates(directory=os.path.join(os.path.dirname(__file__), "templates"))
+
+
+def _fmt_dt(value) -> str:
+    if value is None:
+        return "—"
+    return value.strftime("%Y-%m-%d %H:%M:%S %Z").strip()
+
+
+def _fmt_val(value) -> str:
+    return "NULL" if value is None else str(value)
+
+
+templates.env.filters["dt"] = _fmt_dt
+templates.env.filters["val"] = _fmt_val
 
 
 def _connect() -> psycopg.Connection:
@@ -82,3 +110,88 @@ def export(order_id: int):
             f'filename="test_order_{order_id}_extract.sql"'
         },
     )
+
+
+# ---------------------------------------------------------------- 历史溯源
+
+@app.post("/history/enable")
+def history_enable():
+    """启用留痕：单事务内锁表 -> 建对象 -> 快照基线；失败整体回滚。"""
+    try:
+        with _connect() as conn:
+            baseline_rows = enable_audit(conn)
+    except AlreadyEnabled as exc:
+        return RedirectResponse(f"/history?msg={quote(str(exc))}", status_code=303)
+    except psycopg.errors.LockNotAvailable:
+        return _error_page(
+            503, "有未提交的长事务正在写入，未能在 5 秒内取得锁；"
+                 "未做任何改动，请稍后重试。")
+    except (RuntimeError, psycopg.Error) as exc:
+        return _error_page(500, f"启用留痕失败（已整体回滚，未留下半启用状态）：{exc}")
+    msg = (f"留痕已启用：已保存四表基线共 {baseline_rows} 行；"
+           "此后任何 SQL 连接对四表的行级增删改都会按事务记录。")
+    return RedirectResponse(f"/history?msg={quote(msg)}", status_code=303)
+
+
+@app.get("/history", response_class=HTMLResponse)
+def history_page(request: Request, order_id: int | None = None,
+                 all: int = 0, msg: str = ""):
+    with _connect() as conn:
+        conn.read_only = True  # 浏览历史只读快照，不阻塞写入
+        status = audit_status(conn)
+        context: dict = {
+            "status": status, "msg": msg,
+            "order_id": order_id, "show_all": bool(all),
+        }
+        if status["enabled"]:
+            timeline = build_timeline(conn)
+            orders = known_orders(timeline, conn)
+            context["orders"] = orders
+            if order_id is not None:
+                context["order_exists"] = any(o["id"] == order_id for o in orders)
+                context["corrections"] = timeline.corrections
+                context["relevance"] = correction_relevance(timeline, order_id)
+    return templates.TemplateResponse(
+        request=request, name="history.html", context=context)
+
+
+@app.get("/history/order/{order_id}/correction/{seq}", response_class=HTMLResponse)
+def history_detail(request: Request, order_id: int, seq: int):
+    with _connect() as conn:
+        conn.read_only = True
+        if not audit_status(conn)["enabled"]:
+            return _error_page(404, "历史留痕尚未启用。")
+        timeline = build_timeline(conn)
+        corr = next(
+            (c for c in timeline.corrections if c.commit_seq == seq), None)
+        if corr is None:
+            return _error_page(404, f"不存在序号为 {seq} 的已提交更正。")
+        before = timeline.state_at(seq - 1)
+        after = timeline.state_at(seq)
+        root = (order_id,)
+        clo_before = closure(timeline.tables, before, root)
+        clo_after = closure(timeline.tables, after, root)
+        if not clo_before[ROOT_TABLE] and not clo_after[ROOT_TABLE]:
+            return _error_page(
+                404, f"检测单 id={order_id} 在第 {seq} 次更正前后均不存在。")
+        diffs = diff_closures(timeline.tables, clo_before, clo_after)
+        clo_keys = closure_keys(timeline.tables, before, root) | \
+            closure_keys(timeline.tables, after, root)
+        relevance = correction_relevance(timeline, order_id)
+        relevant_seqs = sorted(s for s, r in relevance.items() if r)
+        order_row = clo_after[ROOT_TABLE].get(root) or clo_before[ROOT_TABLE].get(root)
+        context = {
+            "order_id": order_id,
+            "order_no": (order_row or {}).get("order_no"),
+            "corr": corr,
+            "relevant": relevance.get(seq, False),
+            "path_before": retest_path(before, order_id),
+            "path_after": retest_path(after, order_id),
+            "diffs": diffs,
+            "any_changed": any(b["n_changed"] for b in diffs),
+            "changes": describe_changes(timeline, corr, clo_keys),
+            "prev_seq": max((s for s in relevant_seqs if s < seq), default=None),
+            "next_seq": min((s for s in relevant_seqs if s > seq), default=None),
+        }
+    return templates.TemplateResponse(
+        request=request, name="history_detail.html", context=context)
